@@ -1,0 +1,156 @@
+name: Build modified IPA (Theos)
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      ipa_base_path:
+        description: "Caminho da IPA-base dentro do repositório"
+        required: false
+        default: "IPA-base.ipa"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      THEOS: /tmp/theos
+      IPA_BASE_PATH: ${{ inputs.ipa_base_path || 'IPA-base.ipa' }}
+      OUTPUT_IPA: 3105-unsigned.ipa
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verificar IPA-base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "IPA-base configurada: ${IPA_BASE_PATH}"
+          test -f "${IPA_BASE_PATH}" || {
+            echo "ERRO: IPA-base não encontrada em '${IPA_BASE_PATH}'."
+            echo "Adicione a IPA-base ao repositório ou altere ipa_base_path no workflow_dispatch."
+            exit 1
+          }
+          case "${IPA_BASE_PATH}" in
+            *.ipa) ;;
+            *) echo "ERRO: a IPA-base precisa ter extensão .ipa"; exit 1 ;;
+          esac
+          unzip -tq "${IPA_BASE_PATH}"
+          mkdir -p work/base
+          unzip -q "${IPA_BASE_PATH}" -d work/base
+          test -d work/base/Payload || {
+            echo "ERRO: a IPA-base não contém o diretório Payload/."
+            exit 1
+          }
+          APP_COUNT="$(find work/base/Payload -maxdepth 1 -type d -name '*.app' -print | wc -l | tr -d ' ')"
+          test "${APP_COUNT}" -eq 1 || {
+            echo "ERRO: esperada exatamente uma aplicação em Payload/, encontradas ${APP_COUNT}."
+            find work/base/Payload -maxdepth 1 -type d -name '*.app' -print
+            exit 1
+          }
+          APP_BUNDLE="$(find work/base/Payload -maxdepth 1 -type d -name '*.app' -print -quit)"
+          APP_EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${APP_BUNDLE}/Info.plist")
+          test -n "${APP_EXECUTABLE}" || { echo "ERRO: CFBundleExecutable ausente."; exit 1; }
+          test -f "${APP_BUNDLE}/${APP_EXECUTABLE}" || {
+            echo "ERRO: executável '${APP_EXECUTABLE}' não encontrado dentro da aplicação."
+            exit 1
+          }
+          {
+            echo "APP_BUNDLE=${APP_BUNDLE}"
+            echo "APP_EXECUTABLE=${APP_EXECUTABLE}"
+          } >> "$GITHUB_ENV"
+          echo "Aplicativo da IPA-base: ${APP_BUNDLE}"
+          echo "Executável: ${APP_EXECUTABLE}"
+
+      - name: Instalar ferramentas
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ldid dpkg xz
+          rm -rf "${THEOS}"
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "${THEOS}"
+          if [ ! -d "${THEOS}/sdks" ] || [ -z "$(find "${THEOS}/sdks" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            rm -rf "${THEOS}/sdks"
+            git clone --depth 1 https://github.com/theos/sdks.git "${THEOS}/sdks"
+          fi
+          rm -rf work/insert_dylib
+          git clone --depth 1 https://github.com/tyilo/insert_dylib.git work/insert_dylib
+          make -C work/insert_dylib
+          test -x work/insert_dylib/build/insert_dylib || {
+            echo "ERRO: insert_dylib não foi compilado."
+            exit 1
+          }
+
+      - name: Compilar tweak Objective-C com Theos
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f Makefile
+          test -f Tweak.m
+          make clean package FINALPACKAGE=1
+          DEB_PATH="$(find packages -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          test -n "${DEB_PATH}" || { echo "ERRO: Theos não gerou o pacote .deb."; exit 1; }
+          echo "DEB_PATH=${DEB_PATH}" >> "$GITHUB_ENV"
+          mkdir -p work/tweak
+          dpkg-deb -x "${DEB_PATH}" work/tweak
+          DYLIB_PATH="$(find work/tweak -type f -name '*.dylib' -print -quit)"
+          test -n "${DYLIB_PATH}" || { echo "ERRO: o pacote não contém um dylib."; exit 1; }
+          echo "DYLIB_PATH=${DYLIB_PATH}" >> "$GITHUB_ENV"
+          cp "${DYLIB_PATH}" "${APP_BUNDLE}/FilzaApplySandboxExt.dylib"
+          if [ -f work/tweak/Library/MobileSubstrate/DynamicLibraries/FilzaApplySandboxExt.plist ]; then
+            cp work/tweak/Library/MobileSubstrate/DynamicLibraries/FilzaApplySandboxExt.plist "${APP_BUNDLE}/FilzaApplySandboxExt.plist"
+          fi
+
+      - name: Injetar tweak no executável da aplicação
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x work/insert_dylib/build/insert_dylib
+          work/insert_dylib/build/insert_dylib \
+            --inplace --all-yes --strip-codesig \
+            '@executable_path/FilzaApplySandboxExt.dylib' \
+            "${APP_BUNDLE}/${APP_EXECUTABLE}"
+          ldid -S "${APP_BUNDLE}/FilzaApplySandboxExt.dylib"
+          ldid -S "${APP_BUNDLE}/${APP_EXECUTABLE}"
+
+      - name: Montar e verificar IPA modificada
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "${OUTPUT_IPA}"
+          (cd work/base && zip -qry "../../${OUTPUT_IPA}" Payload)
+          test -s "${OUTPUT_IPA}"
+          unzip -tq "${OUTPUT_IPA}"
+          unzip -l "${OUTPUT_IPA}" | grep -F 'FilzaApplySandboxExt.dylib'
+          unzip -p "${OUTPUT_IPA}" "Payload/${APP_BUNDLE##*/}/${APP_EXECUTABLE}" > work/final-executable
+          file work/final-executable
+          ldid -e work/final-executable >/dev/null
+          shasum -a 256 "${OUTPUT_IPA}"
+          {
+            echo "## Build concluído"
+            echo ""
+            echo "- IPA-base: \\`${IPA_BASE_PATH}\\`"
+            echo "- Aplicativo: \\`${APP_BUNDLE##*/}\\`"
+            echo "- Executável modificado: \\`${APP_EXECUTABLE}\\`"
+            echo "- Saída: \\`${OUTPUT_IPA}\\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar IPA final em Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3105-unsigned
+          path: 3105-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publicar pacote Theos para diagnóstico
+        uses: actions/upload-artifact@v4
+        with:
+          name: FilzaApplySandboxExt-theos-deb
+          path: packages/*.deb
+          if-no-files-found: error
+          retention-days: 7
